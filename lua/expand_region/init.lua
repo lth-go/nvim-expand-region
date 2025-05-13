@@ -2,6 +2,7 @@ local M = {
   opts = {
     text_objects = {
       ["iw"] = 0,
+      ["iW"] = 0,
       ['i"'] = 0,
       ["i'"] = 0,
       ["i`"] = 0,
@@ -58,6 +59,51 @@ M.remove_duplicate = function(input)
   end
 
   return result
+end
+
+M.remove_out_of_bounds = function()
+  local recursive_candidates = {}
+  local not_recursive_candidates = {}
+
+  for _, i in ipairs(M.candidates) do
+    if M.opts.text_objects[i.text_object] == 1 then
+      if i.length > 0 then
+        table.insert(recursive_candidates, i)
+      end
+    end
+
+    if M.opts.text_objects[i.text_object] == 0 then
+      if i.length > 0 then
+        table.insert(not_recursive_candidates, i)
+      end
+    end
+  end
+
+  local dels = {}
+
+  for _, i in ipairs(not_recursive_candidates) do
+    for _, j in ipairs(recursive_candidates) do
+      if M.compare_pos(i.start_pos, j.start_pos) < 0 then
+        dels[i.text_object] = true
+        break
+      end
+
+      if M.compare_pos(i.end_pos, j.end_pos) > 0 then
+        dels[i.text_object] = true
+        break
+      end
+    end
+  end
+
+  local candidates = {}
+
+  for _, i in ipairs(M.candidates) do
+    if not dels[i.text_object] then
+      table.insert(candidates, i)
+    end
+  end
+
+  M.candidates = candidates
 end
 
 -- Return a single candidate dictionary. Each dictionary contains the following:
@@ -140,7 +186,7 @@ M.get_candidate_list = function()
       count = count + 1
       previous = candidate.length
 
-      if count > 100 then
+      if count > 20 then
         break
       end
     end
@@ -224,6 +270,8 @@ M.compute_candidates = function(cursor_pos)
 
   --Remove duplicates
   M.candidates = M.remove_duplicate(M.candidates)
+
+  M.remove_out_of_bounds()
 end
 
 -- Perform the visual selection at the end
