@@ -13,8 +13,13 @@ local M = {
       ["i}"] = 1,
       ["a}"] = 1,
     },
+    max_depth = 20,
+    disable_treesitter = false,
   },
-  saved_pos = {},
+  saved_pos = {
+    start_pos = {},
+    end_pos = {},
+  },
   cur_index = 0,
   candidates = {},
 }
@@ -32,11 +37,11 @@ end
 M.is_cursor_inside = function(region)
   local pos = M.saved_pos
 
-  if M.compare_pos(pos, region.start_pos) < 0 then
+  if M.compare_pos(pos.start_pos, region.start_pos) < 0 then
     return false
   end
 
-  if M.compare_pos(pos, region.end_pos) > 0 then
+  if M.compare_pos(pos.end_pos, region.end_pos) > 0 then
     return false
   end
 
@@ -66,7 +71,7 @@ M.remove_out_of_bounds = function()
   local not_recursive_candidates = {}
 
   for _, i in ipairs(M.candidates) do
-    if M.opts.text_objects[i.text_object] == 1 then
+    if M.opts.text_objects[i.text_object] ~= 0 then
       if i.length > 0 then
         table.insert(recursive_candidates, i)
       end
@@ -186,7 +191,7 @@ M.get_candidate_list = function()
       count = count + 1
       previous = candidate.length
 
-      if count > 20 then
+      if count > M.opts.max_depth then
         break
       end
     end
@@ -205,16 +210,26 @@ M.get_visual_selection = function()
   local start_pos = vim.fn.getpos("'<")
   local end_pos = vim.fn.getpos("'>")
 
-  local col_to = math.min(end_pos[3] + 1, #vim.api.nvim_buf_get_lines(0, end_pos[2] - 1, end_pos[2], false)[1])
-
-  local lines = vim.api.nvim_buf_get_text(0, start_pos[2] - 1, start_pos[3], end_pos[2] - 1, col_to, {})
-  local text = table.concat(lines, "\n")
+  local text = M.get_text(start_pos, end_pos)
 
   return {
     start_pos = start_pos,
     end_pos = end_pos,
     length = #text,
   }
+end
+
+M.get_text = function(start_pos, end_pos)
+  local col_to = math.min(end_pos[3] + 1, #(vim.api.nvim_buf_get_lines(0, end_pos[2] - 1, end_pos[2], false)[1] or ""))
+
+  local ok, lines = pcall(vim.api.nvim_buf_get_text, 0, start_pos[2] - 1, start_pos[3], end_pos[2] - 1, col_to, {})
+  if not ok then
+    return ""
+  end
+
+  local text = table.concat(lines, "\n")
+
+  return text
 end
 
 -- Figure out whether we should compute the candidate text objects, or we're in the middle of an expand/shrink.
@@ -244,15 +259,22 @@ end
 
 -- Computes the list of text object candidates to be used given the current
 -- cursor position.
-M.compute_candidates = function(cursor_pos)
+M.compute_candidates = function()
   -- Reset index into the candidates list
   M.cur_index = 0
 
   -- Save the current cursor position so we can restore it later
-  M.saved_pos = cursor_pos
+  M.saved_pos = {
+    start_pos = vim.fn.getpos("'<"),
+    end_pos = vim.fn.getpos("'>"),
+  }
 
   -- Compute a list of candidate regions
   M.candidates = M.get_candidate_list()
+
+  if not M.opts.disable_treesitter then
+    M.candidates = vim.list_extend(M.candidates, M.get_treesitter_candidate_list())
+  end
 
   -- Sort them and remove the ones with 0 or 1 length
   M.candidates = vim.tbl_filter(function(value)
@@ -276,8 +298,11 @@ end
 
 -- Perform the visual selection at the end
 M.select_region = function()
+  local pos = M.cur_index == 0 and M.saved_pos or M.candidates[M.cur_index]
+
+  vim.fn.setpos(".", pos.start_pos)
   vim.cmd("normal! v")
-  vim.cmd("normal " .. M.candidates[M.cur_index].text_object)
+  vim.fn.setpos(".", pos.end_pos)
 end
 
 M.expand_region = function(mode, direction)
@@ -287,15 +312,15 @@ M.expand_region = function(mode, direction)
   end
 
   if M.should_compute_candidates(mode) then
-    M.compute_candidates(vim.fn.getpos("."))
+    M.compute_candidates()
   else
-    vim.fn.setpos(".", M.saved_pos)
+    vim.fn.setpos(".", M.saved_pos.start_pos)
   end
 
   if direction == "+" then
     -- Expanding
     if M.cur_index == #M.candidates then
-      vim.cmd("normal! gv")
+      M.select_region()
     else
       M.cur_index = M.cur_index + 1
       -- Associate the window view with the text object
@@ -304,8 +329,8 @@ M.expand_region = function(mode, direction)
     end
   else
     -- Shrinking
-    if M.cur_index <= 1 then
-      vim.cmd("normal! gv")
+    if M.cur_index == 0 then
+      M.select_region()
     else
       -- Restore the window view
       vim.fn.winrestview(M.candidates[M.cur_index].prev_winview)
@@ -315,9 +340,68 @@ M.expand_region = function(mode, direction)
   end
 end
 
+M.get_treesitter_candidate_list = function()
+  local candidates = {}
+
+  local node = vim.treesitter.get_node()
+  if node == nil then
+    return candidates
+  end
+
+  local candidate = M.get_treesitter_candidate_dict(node)
+  if candidate.length == 0 then
+    return candidates
+  end
+
+  table.insert(candidates, candidate)
+
+  for _ = 1, M.opts.max_depth do
+    local parent = node:parent()
+    if parent == nil or parent == node then
+      break
+    end
+
+    local parent_candidate = M.get_treesitter_candidate_dict(parent)
+    if parent_candidate.length == 0 then
+      break
+    end
+
+    table.insert(candidates, parent_candidate)
+
+    node = parent
+  end
+
+  return candidates
+end
+
+M.get_treesitter_candidate_dict = function(node)
+  local start_row, start_col, end_row, end_col = node:range()
+
+  local start_pos = { 0, start_row + 1, start_col + 1, 0 }
+  local end_pos = { 0, end_row + 1, end_col, 0 }
+
+  local text = end_col > 0 and M.get_text(start_pos, end_pos) or ""
+
+  return {
+    treesitter_type = node:type(),
+    text_object = "",
+    start_pos = start_pos,
+    end_pos = end_pos,
+    length = #text,
+  }
+end
+
 M.setup = function(opts)
   if opts.text_objects then
     M.opts.text_objects = opts.text_objects
+  end
+
+  if opts.disable_treesitter then
+    M.opts.disable_treesitter = true
+  end
+
+  if opts.max_depth then
+    M.opts.max_depth = opts.max_depth
   end
 
   vim.keymap.set("x", "<Plug>(expand_region_expand)", function()
@@ -331,19 +415,6 @@ M.setup = function(opts)
   if not opts.disable_default_mappings then
     vim.keymap.set("x", "v", "<Plug>(expand_region_expand)", {})
     vim.keymap.set("x", "V", "<Plug>(expand_region_shrink)", {})
-  end
-
-  if not opts.disable_treesitter then
-    local ok, incremental_selection = pcall(require, "nvim-treesitter.incremental_selection")
-    if ok then
-      vim.keymap.set("x", "in", function()
-        for _ = 1, vim.v.count1 do
-          incremental_selection.node_incremental()
-        end
-      end, { silent = true })
-    end
-
-    M.opts.text_objects["in"] = 1
   end
 end
 
